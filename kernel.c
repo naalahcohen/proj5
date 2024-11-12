@@ -149,6 +149,7 @@ uintptr_t find_free(int owner) {
 //    %rip and %rsp, gives it a stack page, and marks it as runnable.
 
 void process_setup(pid_t pid, int program_number) {
+    log_printf("got to process setup\n");
     process_init(&processes[pid], 0);
 
     //set up page tables
@@ -186,19 +187,23 @@ void process_setup(pid_t pid, int program_number) {
         vamapping kernel_mapping = virtual_memory_lookup(kernel_pagetable, addr);
         virtual_memory_map(pt4, addr, kernel_mapping.pa, PAGESIZE, kernel_mapping.perm);
     }
-    
+    log_printf("got past virtual memory setyp\n");
     processes[pid].p_pagetable = pt4;
 
     // load and map to memory
     int r = program_load(&processes[pid], program_number, NULL);
     assert(r >= 0);
 
-    processes[pid].p_registers.reg_rsp = PROC_START_ADDR + PROC_SIZE * pid;
+    processes[pid].p_registers.reg_rsp = MEMSIZE_VIRTUAL;
     uintptr_t stack_page = processes[pid].p_registers.reg_rsp - PAGESIZE;
-    assign_physical_page(stack_page, pid);
-    virtual_memory_map(processes[pid].p_pagetable, stack_page, stack_page,
-                       PAGESIZE, PTE_P | PTE_W | PTE_U);
+    // assign_physical_page(stack_page, pid);
+    
+    uintptr_t free_page = find_free(pid);
+    assign_physical_page(free_page, pid);
 
+    virtual_memory_map(processes[pid].p_pagetable, stack_page, free_page,
+                       PAGESIZE, PTE_P | PTE_W | PTE_U);
+    log_printf("also working\n");
     // Mark the process as runnable
     processes[pid].p_state = P_RUNNABLE;    
 }
@@ -352,7 +357,9 @@ void exception(x86_64_registers* reg) {
         //do u need to do any checks here?
 
         uintptr_t freepage = find_free(current->p_pid);
+        log_printf("value of the page: %d \n", freepage);
         if(freepage % PAGESIZE != 0 || freepage >= MEMSIZE_PHYSICAL || (freepage >= 0xA0000 && freepage < PROC_START_ADDR) || freepage == 0){
+            log_printf("getting here");
             current->p_registers.reg_rax = -1; 
             break;
         }
@@ -372,6 +379,11 @@ void exception(x86_64_registers* reg) {
         }
         break;
     }
+
+    // case INT_FORK:
+    // {
+
+    // }
 
     case INT_SYS_MAPPING:
     {
