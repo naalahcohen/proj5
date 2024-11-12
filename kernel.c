@@ -132,36 +132,34 @@ void kernel(const char* command) {
     run(&processes[1]);
 }
 
+//helper function 
 uintptr_t find_free(int owner) {
     for (int pn = 0; pn < NPAGES; ++pn) {
         if (pageinfo[pn].refcount == 0) {         
             pageinfo[pn].refcount = 1;           
-            pageinfo[pn].owner = owner;           
-            return PAGEADDRESS(pn);              
+            pageinfo[pn].owner = owner;
+            uintptr_t addr = PAGEADDRESS(pn);
+            assert(addr % PAGESIZE == 0);  // Ensure alignment
+            return addr;
         }
     }
     return (uintptr_t) -1;                                     
 }
 
-// process_setup(pid, program_number)
-//    Load application program `program_number` as process number `pid`.
-//    This loads the application's code and data into memory, sets its
-//    %rip and %rsp, gives it a stack page, and marks it as runnable.
-
-void process_setup(pid_t pid, int program_number) {
-    log_printf("got to process setup\n");
-    process_init(&processes[pid], 0);
-
-    //set up page tables
-    uintptr_t l4_page = find_free(pid);
-    uintptr_t l3_page = find_free(pid);
-    uintptr_t l2_page = find_free(pid);
-    uintptr_t l1_page1 = find_free(pid);
-    uintptr_t l1_page2 = find_free(pid);
+uintptr_t make_pagetable(pid_t owner) {
+    uintptr_t l4_page = find_free(owner);
+    uintptr_t l3_page = find_free(owner);
+    uintptr_t l2_page = find_free(owner);
+    uintptr_t l1_page1 = find_free(owner);
+    uintptr_t l1_page2 = find_free(owner);
 
     if (!l4_page || !l3_page || !l2_page || !l1_page1 || !l1_page2) {
-        // somehow handle memory error idk how tho 
-        return;
+        if (l4_page) pageinfo[PAGENUMBER(l4_page)].refcount = 0;
+        if (l3_page) pageinfo[PAGENUMBER(l3_page)].refcount = 0;
+        if (l2_page) pageinfo[PAGENUMBER(l2_page)].refcount = 0;
+        if (l1_page1) pageinfo[PAGENUMBER(l1_page1)].refcount = 0;
+        if (l1_page2) pageinfo[PAGENUMBER(l1_page2)].refcount = 0;
+        return (uintptr_t)-1;
     }
 
     x86_64_pagetable *pt4 = (x86_64_pagetable*) l4_page;
@@ -176,36 +174,80 @@ void process_setup(pid_t pid, int program_number) {
     memset(pt1_0, 0, PAGESIZE);
     memset(pt1_1, 0, PAGESIZE);
 
-    //linking page tables 
     pt4->entry[0] = (uintptr_t) pt3 | PTE_P | PTE_W | PTE_U;
     pt3->entry[0] = (uintptr_t) pt2 | PTE_P | PTE_W | PTE_U;
     pt2->entry[0] = (uintptr_t) pt1_0 | PTE_P | PTE_W | PTE_U;
     pt2->entry[1] = (uintptr_t) pt1_1 | PTE_P | PTE_W | PTE_U;
 
-    // mapping 3MB of virtual memory 
-    for (uintptr_t addr = 0; addr < PROC_START_ADDR; addr += PAGESIZE) {
-        vamapping kernel_mapping = virtual_memory_lookup(kernel_pagetable, addr);
-        virtual_memory_map(pt4, addr, kernel_mapping.pa, PAGESIZE, kernel_mapping.perm);
+    return l4_page;
+}
+
+//helper function 
+void free_child_resources(x86_64_pagetable* child_pagetable, pid_t child_pid) {
+    for (int pn = 0; pn < NPAGES; pn++) {
+        if (pageinfo[pn].owner == child_pid) {
+            pageinfo[pn].refcount = 0;
+            pageinfo[pn].owner = PO_FREE;
+        }
     }
-    log_printf("got past virtual memory setyp\n");
+}
+// process_setup(pid, program_number)
+//    Load application program `program_number` as process number `pid`.
+//    This loads the application's code and data into memory, sets its
+//    %rip and %rsp, gives it a stack page, and marks it as runnable.
+
+void process_setup(pid_t pid, int program_number) {
+    log_printf("got to process setup\n");
+    process_init(&processes[pid], 0);
+
+    uintptr_t l4_page = make_pagetable(pid);
+    if (l4_page == (uintptr_t)-1) {
+        return; // Page table setup failed
+    }
+    x86_64_pagetable* pt4 = (x86_64_pagetable*) l4_page;
+
+    // Map kernel and console pages
+    for (uintptr_t addr = 0; addr < MEMSIZE_PHYSICAL; addr += PAGESIZE) {
+        if (addr == CONSOLE_ADDR || addr < PROC_START_ADDR) {
+            int r = virtual_memory_map(pt4, addr, addr, PAGESIZE, PTE_P | PTE_W);
+            if (r < 0) {
+                free_child_resources(pt4, pid);
+                return;
+            }
+        }
+    }
+
+    // Map the console address specifically with user access
+    int r = virtual_memory_map(pt4, CONSOLE_ADDR, CONSOLE_ADDR, PAGESIZE, PTE_P | PTE_W | PTE_U);
+    if (r < 0) {
+        free_child_resources(pt4, pid);
+        return;
+    }
+
     processes[pid].p_pagetable = pt4;
 
-    // load and map to memory
-    int r = program_load(&processes[pid], program_number, NULL);
+    // Load the program into memory
+    r = program_load(&processes[pid], program_number, NULL);
     assert(r >= 0);
 
+    // Set up the stack
     processes[pid].p_registers.reg_rsp = MEMSIZE_VIRTUAL;
     uintptr_t stack_page = processes[pid].p_registers.reg_rsp - PAGESIZE;
-    // assign_physical_page(stack_page, pid);
     
     uintptr_t free_page = find_free(pid);
+    if (free_page == (uintptr_t)-1) {
+        free_child_resources(pt4, pid);
+        return;
+    }
     assign_physical_page(free_page, pid);
 
-    virtual_memory_map(processes[pid].p_pagetable, stack_page, free_page,
-                       PAGESIZE, PTE_P | PTE_W | PTE_U);
-    log_printf("also working\n");
-    // Mark the process as runnable
-    processes[pid].p_state = P_RUNNABLE;    
+    if (virtual_memory_map(processes[pid].p_pagetable, stack_page, free_page,
+                          PAGESIZE, PTE_P | PTE_W | PTE_U) < 0) {
+        free_child_resources(pt4, pid);
+        return;
+    }
+
+    processes[pid].p_state = P_RUNNABLE;
 }
 
 
@@ -278,8 +320,11 @@ void syscall_mem_tog(proc* process){
 }
 
 
-
-
+x86_64_pagetable* allocpage(uintptr_t l4_page_physical) {
+    x86_64_pagetable* new_pagetable = (x86_64_pagetable*) l4_page_physical;
+    memset(new_pagetable, 0, PAGESIZE);
+    return new_pagetable;
+}
 
 
 
@@ -380,10 +425,84 @@ void exception(x86_64_registers* reg) {
         break;
     }
 
-    // case INT_FORK:
-    // {
+    case INT_SYS_FORK: {
+        pid_t child_pid = -1;
+        for (pid_t i = 1; i < NPROC; i++) {
+            if (processes[i].p_state == P_FREE) {
+                child_pid = i;
+                break;
+            }
+        }
+        if (child_pid == -1) {
+            current->p_registers.reg_rax = -1;
+            break;
+        }
+        
+        process_init(&processes[child_pid], 0);
 
-    // }
+        // Create new page tables for child
+        uintptr_t l4_page = make_pagetable(child_pid);
+        if (l4_page == (uintptr_t)-1) {
+            current->p_registers.reg_rax = -1;
+            break;
+        }
+        x86_64_pagetable* child_pagetable = (x86_64_pagetable*) l4_page;
+
+        // First, identity map kernel memory
+        for (uintptr_t addr = 0; addr < PROC_START_ADDR; addr += PAGESIZE) {
+            int r = virtual_memory_map(child_pagetable, addr, addr, PAGESIZE, PTE_P | PTE_W);
+            if (r < 0) {
+                free_child_resources(child_pagetable, child_pid);
+                current->p_registers.reg_rax = -1;
+                break;
+            }
+        }
+
+        // Map console with user permissions
+        int r = virtual_memory_map(child_pagetable, CONSOLE_ADDR, CONSOLE_ADDR, 
+                                PAGESIZE, PTE_P | PTE_W | PTE_U);
+        if (r < 0) {
+            free_child_resources(child_pagetable, child_pid);
+            current->p_registers.reg_rax = -1;
+            break;
+        }
+
+        // Now copy user memory (everything above PROC_START_ADDR)
+        for (uintptr_t va = PROC_START_ADDR; va < MEMSIZE_VIRTUAL; va += PAGESIZE) {
+            vamapping parent_mapping = virtual_memory_lookup(current->p_pagetable, va);
+            
+            if (parent_mapping.pa != 0 && (parent_mapping.perm & PTE_P)) {
+                uintptr_t new_pa = find_free(child_pid);
+                if (new_pa == (uintptr_t)-1) {
+                    free_child_resources(child_pagetable, child_pid);
+                    current->p_registers.reg_rax = -1;
+                    break;
+                }
+                
+                // Copy the page contents
+                memcpy((void*)new_pa, (void*)parent_mapping.pa, PAGESIZE);
+                
+                // Map it in the child's page table
+                r = virtual_memory_map(child_pagetable, va, new_pa, 
+                                    PAGESIZE, parent_mapping.perm);
+                if (r < 0) {
+                    free_child_resources(child_pagetable, child_pid);
+                    current->p_registers.reg_rax = -1;
+                    break;
+                }
+            }
+        }
+
+        // Set up child process
+        processes[child_pid].p_registers = current->p_registers;
+        processes[child_pid].p_registers.reg_rax = 0;    // Child gets 0
+        processes[child_pid].p_pagetable = child_pagetable;
+        processes[child_pid].p_state = P_RUNNABLE;
+        current->p_registers.reg_rax = child_pid;        // Parent gets child's PID
+
+        break;
+    }
+
 
     case INT_SYS_MAPPING:
     {
