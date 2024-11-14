@@ -147,6 +147,7 @@ uintptr_t find_free(int owner) {
 }
 
 uintptr_t make_pagetable(pid_t owner) {
+    // Allocate pages for page table levels
     uintptr_t l4_page = find_free(owner);
     uintptr_t l3_page = find_free(owner);
     uintptr_t l2_page = find_free(owner);
@@ -162,17 +163,24 @@ uintptr_t make_pagetable(pid_t owner) {
         return (uintptr_t)-1;
     }
 
-    x86_64_pagetable *pt4 = (x86_64_pagetable*) l4_page;
-    x86_64_pagetable *pt3 = (x86_64_pagetable*) l3_page;
-    x86_64_pagetable *pt2 = (x86_64_pagetable*) l2_page;
-    x86_64_pagetable *pt1_0 = (x86_64_pagetable*) l1_page1;
-    x86_64_pagetable *pt1_1 = (x86_64_pagetable*) l1_page2;
+    x86_64_pagetable* pt4 = (x86_64_pagetable*) l4_page;
+    x86_64_pagetable* pt3 = (x86_64_pagetable*) l3_page;
+    x86_64_pagetable* pt2 = (x86_64_pagetable*) l2_page;
+    x86_64_pagetable* pt1_0 = (x86_64_pagetable*) l1_page1;
+    x86_64_pagetable* pt1_1 = (x86_64_pagetable*) l1_page2;
 
     memset(pt4, 0, PAGESIZE);
     memset(pt3, 0, PAGESIZE);
     memset(pt2, 0, PAGESIZE);
     memset(pt1_0, 0, PAGESIZE);
     memset(pt1_1, 0, PAGESIZE);
+
+    // Set reference counts for page table pages
+    pageinfo[PAGENUMBER(l4_page)].refcount = 1;
+    pageinfo[PAGENUMBER(l3_page)].refcount = 1;
+    pageinfo[PAGENUMBER(l2_page)].refcount = 1;
+    pageinfo[PAGENUMBER(l1_page1)].refcount = 1;
+    pageinfo[PAGENUMBER(l1_page2)].refcount = 1;
 
     pt4->entry[0] = (uintptr_t) pt3 | PTE_P | PTE_W | PTE_U;
     pt3->entry[0] = (uintptr_t) pt2 | PTE_P | PTE_W | PTE_U;
@@ -424,6 +432,7 @@ void exception(x86_64_registers* reg) {
         }
         break;
     }
+    //physical address not the same for child and parent 
 
     case INT_SYS_FORK: {
         pid_t child_pid = -1;
@@ -440,7 +449,6 @@ void exception(x86_64_registers* reg) {
         
         process_init(&processes[child_pid], 0);
 
-        // Create new page tables for child
         uintptr_t l4_page = make_pagetable(child_pid);
         if (l4_page == (uintptr_t)-1) {
             current->p_registers.reg_rax = -1;
@@ -448,7 +456,7 @@ void exception(x86_64_registers* reg) {
         }
         x86_64_pagetable* child_pagetable = (x86_64_pagetable*) l4_page;
 
-        // First, identity map kernel memory
+        // First map kernel pages
         for (uintptr_t addr = 0; addr < PROC_START_ADDR; addr += PAGESIZE) {
             int r = virtual_memory_map(child_pagetable, addr, addr, PAGESIZE, PTE_P | PTE_W);
             if (r < 0) {
@@ -458,52 +466,60 @@ void exception(x86_64_registers* reg) {
             }
         }
 
-        // Map console with user permissions
-        int r = virtual_memory_map(child_pagetable, CONSOLE_ADDR, CONSOLE_ADDR, 
-                                PAGESIZE, PTE_P | PTE_W | PTE_U);
-        if (r < 0) {
+        // Map console
+        if (virtual_memory_map(child_pagetable, CONSOLE_ADDR, CONSOLE_ADDR,
+                            PAGESIZE, PTE_P | PTE_W | PTE_U) < 0) {
             free_child_resources(child_pagetable, child_pid);
             current->p_registers.reg_rax = -1;
             break;
         }
 
-        // Now copy user memory (everything above PROC_START_ADDR)
+        // Copy/share other pages
         for (uintptr_t va = PROC_START_ADDR; va < MEMSIZE_VIRTUAL; va += PAGESIZE) {
             vamapping parent_mapping = virtual_memory_lookup(current->p_pagetable, va);
             
             if (parent_mapping.pa != 0 && (parent_mapping.perm & PTE_P)) {
-                uintptr_t new_pa = find_free(child_pid);
-                if (new_pa == (uintptr_t)-1) {
-                    free_child_resources(child_pagetable, child_pid);
-                    current->p_registers.reg_rax = -1;
-                    break;
-                }
-                
-                // Copy the page contents
-                memcpy((void*)new_pa, (void*)parent_mapping.pa, PAGESIZE);
-                
-                // Map it in the child's page table
-                r = virtual_memory_map(child_pagetable, va, new_pa, 
-                                    PAGESIZE, parent_mapping.perm);
-                if (r < 0) {
-                    free_child_resources(child_pagetable, child_pid);
-                    current->p_registers.reg_rax = -1;
-                    break;
+                // Check if this is a read-only page
+                if ((parent_mapping.perm & PTE_W) == 0) {
+                    // Share read-only pages by mapping the same physical page
+                    if (virtual_memory_map(child_pagetable, va, parent_mapping.pa,
+                                        PAGESIZE, parent_mapping.perm) < 0) {
+                        free_child_resources(child_pagetable, child_pid);
+                        current->p_registers.reg_rax = -1;
+                        break;
+                    }
+                    pageinfo[PAGENUMBER(parent_mapping.pa)].refcount++;
+                } 
+                else {
+                    // Copy writable pages
+                    uintptr_t new_pa = find_free(child_pid);
+                    if (new_pa == (uintptr_t)-1) {
+                        free_child_resources(child_pagetable, child_pid);
+                        current->p_registers.reg_rax = -1;
+                        break;
+                    }
+
+                    // Set up temporary mapping for copying
+                    if (virtual_memory_map(child_pagetable, va, new_pa,
+                                        PAGESIZE, parent_mapping.perm) < 0) {
+                        free_child_resources(child_pagetable, child_pid);
+                        current->p_registers.reg_rax = -1;
+                        break;
+                    }
+
+                    memcpy((void*)new_pa, (void*)parent_mapping.pa, PAGESIZE);
                 }
             }
         }
 
         // Set up child process
         processes[child_pid].p_registers = current->p_registers;
-        processes[child_pid].p_registers.reg_rax = 0;    // Child gets 0
+        processes[child_pid].p_registers.reg_rax = 0;
+        current->p_registers.reg_rax = child_pid;
         processes[child_pid].p_pagetable = child_pagetable;
         processes[child_pid].p_state = P_RUNNABLE;
-        current->p_registers.reg_rax = child_pid;        // Parent gets child's PID
-
         break;
     }
-
-
     case INT_SYS_MAPPING:
     {
 	    syscall_mapping(current);
