@@ -556,6 +556,81 @@ void exception(x86_64_registers* reg) {
         break;
     }
 
+case INT_SYS_EXIT: {
+    // First free all user pages in the process's address space
+    for (uintptr_t va = PROC_START_ADDR; va < MEMSIZE_VIRTUAL; va += PAGESIZE) {
+        vamapping map = virtual_memory_lookup(current->p_pagetable, va);
+        if (map.pa && (map.perm & PTE_P)) {
+            int page_num = PAGENUMBER(map.pa);
+            if (--pageinfo[page_num].refcount == 0) {
+                pageinfo[page_num].owner = PO_FREE;
+                memset((void*) map.pa, 0, PAGESIZE);  // Clear the page for security
+            }
+            virtual_memory_map(current->p_pagetable, va, 0, PAGESIZE, 0);
+        }
+    }
+
+    // Free page tables from bottom up (L1 to L4) ensuring ownership and refcount consistency
+    x86_64_pagetable* pt = current->p_pagetable;
+    for (int l4i = 0; l4i < 512; l4i++) {
+        if (!(pt->entry[l4i] & PTE_P)) {
+            continue;
+        }
+        x86_64_pagetable* l3 = (x86_64_pagetable*) PTE_ADDR(pt->entry[l4i]);
+        
+        for (int l3i = 0; l3i < 512; l3i++) {
+            if (!(l3->entry[l3i] & PTE_P)) {
+                continue;
+            }
+            x86_64_pagetable* l2 = (x86_64_pagetable*) PTE_ADDR(l3->entry[l3i]);
+            
+            for (int l2i = 0; l2i < 512; l2i++) {
+                if (!(l2->entry[l2i] & PTE_P)) {
+                    continue;
+                }
+                x86_64_pagetable* l1 = (x86_64_pagetable*) PTE_ADDR(l2->entry[l2i]);
+                
+                // Free L1 table
+                int l1_pn = PAGENUMBER((uintptr_t) l1);
+                if (--pageinfo[l1_pn].refcount == 0) {
+                    pageinfo[l1_pn].owner = PO_FREE;
+                    memset(l1, 0, PAGESIZE);  // Clear memory for security
+                }
+            }
+            
+            // Free L2 table
+            int l2_pn = PAGENUMBER((uintptr_t) l2);
+            if (--pageinfo[l2_pn].refcount == 0) {
+                pageinfo[l2_pn].owner = PO_FREE;
+                memset(l2, 0, PAGESIZE);  // Clear memory for security
+            }
+        }
+        
+        // Free L3 table
+        int l3_pn = PAGENUMBER((uintptr_t) l3);
+        if (--pageinfo[l3_pn].refcount == 0) {
+            pageinfo[l3_pn].owner = PO_FREE;
+            memset(l3, 0, PAGESIZE);  // Clear memory for security
+        }
+    }
+
+    // Free L4 (top-level) page table
+    int l4_pn = PAGENUMBER((uintptr_t) pt);
+    if (--pageinfo[l4_pn].refcount == 0) {
+        pageinfo[l4_pn].owner = PO_FREE;
+        memset(pt, 0, PAGESIZE);  // Clear memory for security
+    }
+
+    // Mark process as free and schedule next
+    current->p_state = P_FREE;
+    current->p_pagetable = NULL;
+    schedule();
+    break;
+}
+
+
+
+
     default:
         default_exception(current);
         break;                  /* will not be reached */
@@ -687,6 +762,10 @@ void check_page_table_ownership(x86_64_pagetable* pt, pid_t pid) {
 static void check_page_table_ownership_level(x86_64_pagetable* pt, int level,
                                              int owner, int refcount) {
     assert(PAGENUMBER(pt) < NPAGES);
+    if (pageinfo[PAGENUMBER(pt)].owner != owner) {
+    log_printf("Ownership mismatch at level %d: expected %d, found %d\n", 
+               level, owner, pageinfo[PAGENUMBER(pt)].owner);
+    }
     assert(pageinfo[PAGENUMBER(pt)].owner == owner);
     assert(pageinfo[PAGENUMBER(pt)].refcount == refcount);
     if (level < 3) {
