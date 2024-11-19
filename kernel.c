@@ -1,6 +1,7 @@
 #include "kernel.h"	// DO NOT EDIT!!!
 #include "lib.h"	// DO NOT EDIT!!!
 
+
 // kernel.c
 //
 //    This is the kernel.
@@ -59,14 +60,16 @@ typedef struct physical_pageinfo {
 static physical_pageinfo pageinfo[PAGENUMBER(MEMSIZE_PHYSICAL)];
 
 typedef enum pageowner {
-    PO_FREE = 0,                // this page is free
+    PO_FREE = 0,                // this page is freeop
     PO_RESERVED = -1,           // this page is reserved memory
     PO_KERNEL = -2              // this page is used by the kernel
 } pageowner_t;
 
 static void pageinfo_init(void);
 
-
+typedef int bool;
+#define true 1
+#define false 0
 // Memory functions
 
 void check_virtual_memory(void);
@@ -80,12 +83,10 @@ void memshow_virtual_animate(void);
 //    string is an optional string passed from the boot loader.
 
 static void process_setup(pid_t pid, int program_number);
+// Function prototypes
+uintptr_t make_pagetable(pid_t owner);
+void init_kernel_pagetable(void);
 
-//step 2: 
-//set all five of them to 0
-//map every entry to itself 
-//make a reserve page fucntion 
-//how to copy mappigns into kernel pagetable
 void kernel(const char* command) {
     hardware_init();
     pageinfo_init();
@@ -146,20 +147,110 @@ uintptr_t find_free(int owner) {
     return (uintptr_t) -1;                                     
 }
 
-uintptr_t make_pagetable(pid_t owner) {
-    // Allocate pages for page table levels
-    uintptr_t l4_page = find_free(owner);
-    uintptr_t l3_page = find_free(owner);
-    uintptr_t l2_page = find_free(owner);
-    uintptr_t l1_page1 = find_free(owner);
-    uintptr_t l1_page2 = find_free(owner);
+//helper function 
+void free_child_resources(x86_64_pagetable* child_pagetable, pid_t child_pid) {
+    // Free all user pages (virtual memory mappings)
+    for (uintptr_t va = PROC_START_ADDR; va < MEMSIZE_VIRTUAL; va += PAGESIZE) {
+        vamapping map = virtual_memory_lookup(child_pagetable, va);
+        if (map.pa == (uintptr_t)-1 || map.pa == 0) {
+            log_printf("Invalid mapping for VA %p: PA = %p, Perm = %x\n", va, map.pa, map.perm);
+            continue;  // Skip invalid mappings
+        }
+        if (map.pa && (map.perm & PTE_P)) {
+            int pn = PAGENUMBER(map.pa);
 
-    if (!l4_page || !l3_page || !l2_page || !l1_page1 || !l1_page2) {
-        if (l4_page) pageinfo[PAGENUMBER(l4_page)].refcount = 0;
-        if (l3_page) pageinfo[PAGENUMBER(l3_page)].refcount = 0;
-        if (l2_page) pageinfo[PAGENUMBER(l2_page)].refcount = 0;
-        if (l1_page1) pageinfo[PAGENUMBER(l1_page1)].refcount = 0;
-        if (l1_page2) pageinfo[PAGENUMBER(l1_page2)].refcount = 0;
+            // Decrement reference count, free page if refcount reaches 0
+            if (--pageinfo[pn].refcount == 0) {
+                pageinfo[pn].owner = PO_FREE;
+                memset((void*) map.pa, 0, PAGESIZE); // Clear page for security
+            }
+
+            // Unmap the virtual address
+            virtual_memory_map(child_pagetable, va, 0, PAGESIZE, 0);
+        }
+    }
+
+    // Free all page table pages (L1 to L4)
+    for (int l4i = 0; l4i < 512; l4i++) {
+        if (!(child_pagetable->entry[l4i] & PTE_P)) {
+            continue;
+        }
+        x86_64_pagetable* l3 = (x86_64_pagetable*) PTE_ADDR(child_pagetable->entry[l4i]);
+        
+        for (int l3i = 0; l3i < 512; l3i++) {
+            if (!(l3->entry[l3i] & PTE_P)) {
+                continue;
+            }
+            x86_64_pagetable* l2 = (x86_64_pagetable*) PTE_ADDR(l3->entry[l3i]);
+            
+            for (int l2i = 0; l2i < 512; l2i++) {
+                if (!(l2->entry[l2i] & PTE_P)) {
+                    continue;
+                }
+                x86_64_pagetable* l1 = (x86_64_pagetable*) PTE_ADDR(l2->entry[l2i]);
+                
+                // Free L1 table
+                int l1_pn = PAGENUMBER((uintptr_t) l1);
+                if (--pageinfo[l1_pn].refcount == 0) {
+                    pageinfo[l1_pn].owner = PO_FREE;
+                    memset(l1, 0, PAGESIZE); // Clear page for security
+                }
+            }
+
+            // Free L2 table
+            int l2_pn = PAGENUMBER((uintptr_t) l2);
+            if (--pageinfo[l2_pn].refcount == 0) {
+                pageinfo[l2_pn].owner = PO_FREE;
+                memset(l2, 0, PAGESIZE); // Clear page for security
+            }
+        }
+
+        // Free L3 table
+        int l3_pn = PAGENUMBER((uintptr_t) l3);
+        if (--pageinfo[l3_pn].refcount == 0) {
+            pageinfo[l3_pn].owner = PO_FREE;
+            memset(l3, 0, PAGESIZE); // Clear page for security
+        }
+    }
+
+    // Free L4 (top-level) page table
+    int l4_pn = PAGENUMBER((uintptr_t) child_pagetable);
+    if (--pageinfo[l4_pn].refcount == 0) {
+        pageinfo[l4_pn].owner = PO_FREE;
+        memset(child_pagetable, 0, PAGESIZE); // Clear page for security
+    }
+}
+
+//kernel memory is being mapped and where the memory is 
+uintptr_t make_pagetable(pid_t owner) {
+    uintptr_t l4_page = find_free(owner);
+    if (l4_page == (uintptr_t)-1) {
+        return (uintptr_t)-1;
+    }
+    uintptr_t l3_page = find_free(owner);
+    if (l3_page == (uintptr_t)-1) {
+        free_child_resources((x86_64_pagetable*) l4_page, owner);
+        return (uintptr_t)-1;
+    }
+    uintptr_t l2_page = find_free(owner);
+    if (l2_page == (uintptr_t)-1) {
+        free_child_resources((x86_64_pagetable*) l3_page, owner);
+        free_child_resources((x86_64_pagetable*) l4_page, owner);
+        return (uintptr_t)-1;
+    }
+    uintptr_t l1_page1 = find_free(owner);
+    if (l1_page1 == (uintptr_t)-1) {
+        free_child_resources((x86_64_pagetable*) l2_page, owner);
+        free_child_resources((x86_64_pagetable*) l3_page, owner);
+        free_child_resources((x86_64_pagetable*) l4_page, owner);
+        return (uintptr_t)-1;
+    }
+    uintptr_t l1_page2 = find_free(owner);
+    if (l1_page2 == (uintptr_t)-1) {
+        free_child_resources((x86_64_pagetable*) l1_page1, owner);
+        free_child_resources((x86_64_pagetable*) l2_page, owner);
+        free_child_resources((x86_64_pagetable*) l3_page, owner);
+        free_child_resources((x86_64_pagetable*) l4_page, owner);
         return (uintptr_t)-1;
     }
 
@@ -175,7 +266,6 @@ uintptr_t make_pagetable(pid_t owner) {
     memset(pt1_0, 0, PAGESIZE);
     memset(pt1_1, 0, PAGESIZE);
 
-    // Set reference counts for page table pages
     pageinfo[PAGENUMBER(l4_page)].refcount = 1;
     pageinfo[PAGENUMBER(l3_page)].refcount = 1;
     pageinfo[PAGENUMBER(l2_page)].refcount = 1;
@@ -190,15 +280,7 @@ uintptr_t make_pagetable(pid_t owner) {
     return l4_page;
 }
 
-//helper function 
-void free_child_resources(x86_64_pagetable* child_pagetable, pid_t child_pid) {
-    for (int pn = 0; pn < NPAGES; pn++) {
-        if (pageinfo[pn].owner == child_pid) {
-            pageinfo[pn].refcount = 0;
-            pageinfo[pn].owner = PO_FREE;
-        }
-    }
-}
+
 // process_setup(pid, program_number)
 //    Load application program `program_number` as process number `pid`.
 //    This loads the application's code and data into memory, sets its
@@ -210,6 +292,7 @@ void process_setup(pid_t pid, int program_number) {
 
     uintptr_t l4_page = make_pagetable(pid);
     if (l4_page == (uintptr_t)-1) {
+        current->p_registers.reg_rax = -1; 
         return; // Page table setup failed
     }
     x86_64_pagetable* pt4 = (x86_64_pagetable*) l4_page;
@@ -434,92 +517,111 @@ void exception(x86_64_registers* reg) {
     }
     //physical address not the same for child and parent 
 
-    case INT_SYS_FORK: {
-        pid_t child_pid = -1;
-        for (pid_t i = 1; i < NPROC; i++) {
-            if (processes[i].p_state == P_FREE) {
-                child_pid = i;
-                break;
-            }
-        }
-        if (child_pid == -1) {
-            current->p_registers.reg_rax = -1;
+case INT_SYS_FORK: {
+    pid_t child_pid = -1;
+
+    // Find a free process slot for the child
+    for (pid_t i = 1; i < NPROC; i++) {
+        if (processes[i].p_state == P_FREE) {
+            child_pid = i;
             break;
         }
-        
-        process_init(&processes[child_pid], 0);
+    }
+    if (child_pid == -1) {
+        log_printf("No free process slots available\n");
+        current->p_registers.reg_rax = -1;
+        break;
+    }
 
-        uintptr_t l4_page = make_pagetable(child_pid);
-        if (l4_page == (uintptr_t)-1) {
-            current->p_registers.reg_rax = -1;
-            break;
-        }
-        x86_64_pagetable* child_pagetable = (x86_64_pagetable*) l4_page;
+    process_init(&processes[child_pid], 0);
 
-        // First map kernel pages
-        for (uintptr_t addr = 0; addr < PROC_START_ADDR; addr += PAGESIZE) {
-            int r = virtual_memory_map(child_pagetable, addr, addr, PAGESIZE, PTE_P | PTE_W);
-            if (r < 0) {
-                free_child_resources(child_pagetable, child_pid);
-                current->p_registers.reg_rax = -1;
-                break;
-            }
-        }
+    // Allocate L4 page table
+    uintptr_t l4_page = make_pagetable(child_pid);
+    if (l4_page == (uintptr_t)-1) {
+        log_printf("Failed to create page table for child process %d\n", child_pid);
+        current->p_registers.reg_rax = -1;
+        break;
+    }
 
-        // Map console
-        if (virtual_memory_map(child_pagetable, CONSOLE_ADDR, CONSOLE_ADDR,
-                            PAGESIZE, PTE_P | PTE_W | PTE_U) < 0) {
+    x86_64_pagetable* child_pagetable = (x86_64_pagetable*) l4_page;
+    log_printf("Child process %d allocated L4 page table at %p\n", child_pid, l4_page);
+
+    // Map kernel pages
+    for (uintptr_t addr = 0; addr < PROC_START_ADDR; addr += PAGESIZE) {
+        if (virtual_memory_map(child_pagetable, addr, addr, PAGESIZE, PTE_P | PTE_W) < 0) {
+            log_printf("Failed to map kernel page at VA %p for child %d\n", addr, child_pid);
             free_child_resources(child_pagetable, child_pid);
             current->p_registers.reg_rax = -1;
             break;
         }
+    }
 
-        // Copy/share other pages
-        for (uintptr_t va = PROC_START_ADDR; va < MEMSIZE_VIRTUAL; va += PAGESIZE) {
-            vamapping parent_mapping = virtual_memory_lookup(current->p_pagetable, va);
-            
-            if (parent_mapping.pa != 0 && (parent_mapping.perm & PTE_P)) {
-                // Check if this is a read-only page
-                if ((parent_mapping.perm & PTE_W) == 0) {
-                    // Share read-only pages by mapping the same physical page
-                    if (virtual_memory_map(child_pagetable, va, parent_mapping.pa,
-                                        PAGESIZE, parent_mapping.perm) < 0) {
-                        free_child_resources(child_pagetable, child_pid);
-                        current->p_registers.reg_rax = -1;
-                        break;
-                    }
-                    pageinfo[PAGENUMBER(parent_mapping.pa)].refcount++;
-                } 
-                else {
-                    // Copy writable pages
-                    uintptr_t new_pa = find_free(child_pid);
-                    if (new_pa == (uintptr_t)-1) {
-                        free_child_resources(child_pagetable, child_pid);
-                        current->p_registers.reg_rax = -1;
-                        break;
-                    }
-
-                    // Set up temporary mapping for copying
-                    if (virtual_memory_map(child_pagetable, va, new_pa,
-                                        PAGESIZE, parent_mapping.perm) < 0) {
-                        free_child_resources(child_pagetable, child_pid);
-                        current->p_registers.reg_rax = -1;
-                        break;
-                    }
-
-                    memcpy((void*)new_pa, (void*)parent_mapping.pa, PAGESIZE);
-                }
-            }
-        }
-
-        // Set up child process
-        processes[child_pid].p_registers = current->p_registers;
-        processes[child_pid].p_registers.reg_rax = 0;
-        current->p_registers.reg_rax = child_pid;
-        processes[child_pid].p_pagetable = child_pagetable;
-        processes[child_pid].p_state = P_RUNNABLE;
+    // Map console
+    if (virtual_memory_map(child_pagetable, CONSOLE_ADDR, CONSOLE_ADDR, PAGESIZE, PTE_P | PTE_W | PTE_U) < 0) {
+        log_printf("Failed to map console for child %d\n", child_pid);
+        free_child_resources(child_pagetable, child_pid);
+        current->p_registers.reg_rax = -1;
         break;
     }
+
+    // Copy or share other pages
+    bool error = false;
+    for (uintptr_t va = PROC_START_ADDR; va < MEMSIZE_VIRTUAL; va += PAGESIZE) {
+        vamapping parent_mapping = virtual_memory_lookup(current->p_pagetable, va);
+
+        if (parent_mapping.pa != 0 && (parent_mapping.perm & PTE_P)) {
+            int parent_pn = PAGENUMBER(parent_mapping.pa);
+
+            if ((parent_mapping.perm & PTE_W) == 0) {
+                // Share read-only pages
+                if (virtual_memory_map(child_pagetable, va, parent_mapping.pa, PAGESIZE, parent_mapping.perm) < 0) {
+                    log_printf("Failed to share page VA %p for child %d\n", va, child_pid);
+                    error = true;
+                    break;
+                }
+                pageinfo[parent_pn].refcount++;
+            } else {
+                // Copy writable pages
+                uintptr_t new_pa = find_free(child_pid);
+                if (new_pa == (uintptr_t)-1) {
+                    log_printf("Failed to allocate page for VA %p for child %d\n", va, child_pid);
+                    error = true;
+                    break;
+                }
+
+                pageinfo[PAGENUMBER(new_pa)].owner = child_pid;
+
+                if (virtual_memory_map(child_pagetable, va, new_pa, PAGESIZE, parent_mapping.perm) < 0) {
+                    log_printf("Failed to map copied page VA %p for child %d\n", va, child_pid);
+                    error = true;
+                    break;
+                }
+
+                memcpy((void*) new_pa, (void*) parent_mapping.pa, PAGESIZE);
+                log_printf("Copied page VA %p: Parent PA %p -> Child PA %p\n", va, parent_mapping.pa, new_pa);
+            }
+        }
+    }
+
+    if (error) {
+        free_child_resources(child_pagetable, child_pid);
+        current->p_registers.reg_rax = -1;
+        break;
+    }
+
+    // Set up child process
+    processes[child_pid].p_registers = current->p_registers;
+    processes[child_pid].p_registers.reg_rax = 0;
+    current->p_registers.reg_rax = child_pid;
+    processes[child_pid].p_pagetable = child_pagetable;
+    processes[child_pid].p_state = P_RUNNABLE;
+
+    log_printf("Child process %d forked successfully\n", child_pid);
+    break;
+}
+
+
+
     case INT_SYS_MAPPING:
     {
 	    syscall_mapping(current);
@@ -564,13 +666,14 @@ case INT_SYS_EXIT: {
             int page_num = PAGENUMBER(map.pa);
             if (--pageinfo[page_num].refcount == 0) {
                 pageinfo[page_num].owner = PO_FREE;
-                memset((void*) map.pa, 0, PAGESIZE);  // Clear the page for security
+                log_printf("Freed user page %d\n", page_num);
+                memset((void*) map.pa, 0, PAGESIZE);  // Optional: Clear the page for security
             }
             virtual_memory_map(current->p_pagetable, va, 0, PAGESIZE, 0);
         }
     }
 
-    // Free page tables from bottom up (L1 to L4) ensuring ownership and refcount consistency
+    // Free page tables from bottom up (L1 to L4)
     x86_64_pagetable* pt = current->p_pagetable;
     for (int l4i = 0; l4i < 512; l4i++) {
         if (!(pt->entry[l4i] & PTE_P)) {
@@ -594,7 +697,8 @@ case INT_SYS_EXIT: {
                 int l1_pn = PAGENUMBER((uintptr_t) l1);
                 if (--pageinfo[l1_pn].refcount == 0) {
                     pageinfo[l1_pn].owner = PO_FREE;
-                    memset(l1, 0, PAGESIZE);  // Clear memory for security
+                    log_printf("Freed L1 page table %d\n", l1_pn);
+                    memset(l1, 0, PAGESIZE);  // Optional: Clear memory for security
                 }
             }
             
@@ -602,7 +706,8 @@ case INT_SYS_EXIT: {
             int l2_pn = PAGENUMBER((uintptr_t) l2);
             if (--pageinfo[l2_pn].refcount == 0) {
                 pageinfo[l2_pn].owner = PO_FREE;
-                memset(l2, 0, PAGESIZE);  // Clear memory for security
+                log_printf("Freed L2 page table %d\n", l2_pn);
+                memset(l2, 0, PAGESIZE);  // Optional: Clear memory for security
             }
         }
         
@@ -610,7 +715,8 @@ case INT_SYS_EXIT: {
         int l3_pn = PAGENUMBER((uintptr_t) l3);
         if (--pageinfo[l3_pn].refcount == 0) {
             pageinfo[l3_pn].owner = PO_FREE;
-            memset(l3, 0, PAGESIZE);  // Clear memory for security
+            log_printf("Freed L3 page table %d\n", l3_pn);
+            memset(l3, 0, PAGESIZE);  // Optional: Clear memory for security
         }
     }
 
@@ -618,7 +724,8 @@ case INT_SYS_EXIT: {
     int l4_pn = PAGENUMBER((uintptr_t) pt);
     if (--pageinfo[l4_pn].refcount == 0) {
         pageinfo[l4_pn].owner = PO_FREE;
-        memset(pt, 0, PAGESIZE);  // Clear memory for security
+        log_printf("Freed L4 page table %d\n", l4_pn);
+        memset(pt, 0, PAGESIZE);  // Optional: Clear memory for security
     }
 
     // Mark process as free and schedule next
@@ -627,10 +734,6 @@ case INT_SYS_EXIT: {
     schedule();
     break;
 }
-
-
-
-
     default:
         default_exception(current);
         break;                  /* will not be reached */
